@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+stripe
+python-dotenv
+pytest
+httpx
