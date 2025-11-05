@@ -1,0 +1,38 @@
+name: Docker Build & Push
+
+on:
+  workflow_run:
+    workflows: ["Build & Test Python CI"]
+    types:
+      - completed
+  push:
+    branches: [develop, main]
+
+jobs:
+  docker-build:
+    runs-on: ubuntu-latest
+
+    if: >
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||
+      (github.event_name == 'push')
+
+    steps:
+      # ---- Checkout code ----
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---- Docker login ----
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # ---- Build & Push Docker image ----
+      - name: Build & Push Docker image
+        run: |
+          IMAGE=${{ secrets.DOCKER_USERNAME }}/myesi-billing-service
+          docker build -t $IMAGE:${{ github.sha }} .
+          docker tag $IMAGE:${{ github.sha }} $IMAGE:latest
+          docker push $IMAGE:${{ github.sha }}
+          docker push $IMAGE:latest
