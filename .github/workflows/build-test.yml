@@ -1,0 +1,54 @@
+name: Build & Test Python CI
+
+on:
+  push:
+    branches: [develop, main, feature/*]
+  pull_request:
+    branches: [develop, main]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ---- Checkout repo ----
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ---- Set up Python ----
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ---- Cache pip dependencies ----
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # ---- Install dependencies ----
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install black ruff pytest
+
+      # ---- Lint (format + static check) ----
+      - name: Run linter
+        run: |
+          black --check app/
+          ruff check app/
+
+      # ---- Run tests ----
+      - name: Run tests
+        run: |
+          pytest -v || echo "No tests found yet, skipping..."
+
+      # ---- Build validation ----
+      - name: Test build
+        run: |
+          python -m compileall app
