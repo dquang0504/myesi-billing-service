@@ -2,8 +2,14 @@ from datetime import datetime
 import logging
 import uuid
 from fastapi import APIRouter, Depends, Request, HTTPException
-from sqlalchemy import text, select
-from app.utils.stripe_client import create_checkout_session
+from sqlalchemy import func, text, select
+from app.utils.stripe_client import (
+    create_new_subscription_session,
+    cycle_switch_logic,
+    downgrade_subscription_logic,
+    upgrade_subscription_logic,
+    get_plan,
+)
 from app.core.config import settings
 from app.db.session import get_db
 from app.db.models import (
@@ -20,6 +26,7 @@ import asyncio
 from app.utils.extract_client_info import extract_client_info
 from app.db.models import SubscriptionPlan
 from sqlalchemy.orm import selectinload
+from app.schemas.models import UpdateSubRequest
 
 
 router = APIRouter(prefix="/api/billing", tags=["Billing"])
@@ -27,7 +34,7 @@ logger = logging.getLogger("billing")
 
 
 @router.post("/create-checkout-session")
-async def create_checkout_session_route(
+async def create_new_subscription_session_route(
     payload: dict, request: Request, db: AsyncSession = Depends(get_db)
 ):
     """
@@ -77,7 +84,7 @@ async def create_checkout_session_route(
         loop = asyncio.get_running_loop()
         session = await loop.run_in_executor(
             None,
-            lambda: create_checkout_session(
+            lambda: create_new_subscription_session(
                 customer_email=actor_email,
                 price_id=price_id,
                 idempotency_key=idempotency_key,
@@ -99,7 +106,7 @@ async def create_checkout_session_route(
 
         audit = PaymentAudit(
             actor_id=actor_id,
-            action="CREATE_CHECKOUT_SESSION",
+            action="create_new_subscription_session",
             session_id=session["id"],
             details={"plan": plan.name, "interval": interval, "amount": amount_cents},
             ip_address=client_ip,
@@ -133,6 +140,7 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
 
     client_ip, user_agent = extract_client_info(request)
 
+    # Verify Stripe signature
     try:
         event = stripe.Webhook.construct_event(
             payload, sig_header, settings.STRIPE_WEBHOOK_SECRET
@@ -141,39 +149,346 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     event_id = event.get("id")
+    event_type = event.get("type")
+    data = event.get("data", {}).get("object", {})
 
     # Idempotency check
-    existing = await db.execute(
-        text("SELECT 1 FROM billing_events WHERE event_id = :eid"), {"eid": event_id}
+    existing_event = await db.execute(
+        text("SELECT 1 FROM billing_events WHERE event_id=:eid"),
+        {"eid": event_id},
     )
-    if existing.scalar() is not None:
+    if existing_event.scalar():
         return {"status": "already_processed"}
-
-    # Persist raw event
     db.add(BillingEvent(event_id=event_id, payload=event))
     await db.commit()
 
-    event_type = event.get("type")
-    data = event.get("data", {}).get("object", {})
-    session_id = data.get("id")
-    actor_id = None
+    actor_id, org_id, sub_db_id, old_plan_id, plan_id, interval, stripe_sub_id = (
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 
-    # Lookup actor_id via checkout_records if session_id exists
-    if session_id:
-        res = await db.execute(
-            text("SELECT actor_id FROM checkout_records WHERE session_id = :sid"),
-            {"sid": session_id},
+    # -------------------------
+    # 0️⃣ charge.succeeded
+    # -------------------------
+    if event_type == "charge.succeeded":
+        cust_id = data.get("customer")
+        pm_id = data.get("payment_method")
+
+        if not cust_id or not pm_id:
+            logger.warning(
+                "charge.succeeded missing customer/payment_method → skipping"
+            )
+            return {"status": "ok"}
+
+        # ===== Lấy info payment method từ Stripe =====
+        try:
+            pm = stripe.PaymentMethod.retrieve(pm_id)
+        except Exception as e:
+            logger.error(f"Failed to fetch PaymentMethod from Stripe: {e}")
+            return {"status": "ok"}
+
+        brand = pm.card.brand if pm.card else None
+        last4 = pm.card.last4 if pm.card else None
+        exp_month = pm.card.exp_month if pm.card else None
+        exp_year = pm.card.exp_year if pm.card else None
+
+        # ===== Check duplicate =====
+        row = await db.execute(
+            text("SELECT id FROM payment_methods WHERE stripe_payment_method_id=:pmid"),
+            {"pmid": pm_id},
         )
-        row = res.fetchone()
-        if row:
-            actor_id = row[0]
+        exists = row.fetchone()
 
-    # Persist audit
+        if exists:
+            logger.info(f"Payment method {pm_id} already exists → skip insert.")
+            return {"status": "ok"}
+
+        # ===== Insert =====
+        await db.execute(
+            text(
+                """
+                INSERT INTO payment_methods
+                    (stripe_customer_id, stripe_payment_method_id, brand, last4, exp_month, exp_year, is_default)
+                VALUES
+                    (:cid, :pmid, :brand, :last4, :exp_month, :exp_year, TRUE)
+            """
+            ),
+            {
+                "cid": cust_id,
+                "pmid": pm_id,
+                "brand": brand,
+                "last4": last4,
+                "exp_month": exp_month,
+                "exp_year": exp_year,
+            },
+        )
+
+        await db.commit()
+
+    # -------------------------
+    # 1️⃣ payment_method.attached
+    # -------------------------
+    elif event_type == "payment_method.attached":
+        logger.info("Nothing to process here at payment_method.attached...")
+        pass
+
+    # -------------------------
+    # 2 checkout.session.completed → tạo subscription và payment method
+    # -------------------------
+    elif event_type == "checkout.session.completed":
+        cs_id = data.get("id")
+        # Lấy actor_id từ checkout record
+        row = await db.execute(
+            text("SELECT actor_id FROM checkout_records WHERE session_id=:sid"),
+            {"sid": cs_id},
+        )
+        rec = row.fetchone()
+        if rec:
+            actor_id = rec[0]
+
+        stripe_sub_id = data.get("subscription")
+        if stripe_sub_id and actor_id:
+            # Insert subscription nếu chưa tồn tại
+            row = await db.execute(
+                text("SELECT id FROM subscriptions WHERE stripe_subscription_id=:sid"),
+                {"sid": stripe_sub_id},
+            )
+            if not row.fetchone():
+                await db.execute(
+                    text(
+                        """
+                        INSERT INTO subscriptions (user_id, stripe_customer_id, stripe_subscription_id,
+                                                   status, created_at, updated_at)
+                        VALUES (:uid, :cust, :sid, 'active', NOW(), NOW())
+                        ON CONFLICT (stripe_subscription_id) DO NOTHING
+                    """
+                    ),
+                    {
+                        "uid": actor_id,
+                        "cust": data.get("customer"),
+                        "sid": stripe_sub_id,
+                    },
+                )
+                await db.commit()
+
+            # Lấy sub_db_id mới tạo
+            sub_db_id = (
+                await db.execute(
+                    text(
+                        "SELECT id FROM subscriptions WHERE stripe_subscription_id=:sid"
+                    ),
+                    {"sid": stripe_sub_id},
+                )
+            ).fetchone()[0]
+
+    # -------------------------
+    # 4️⃣ customer.subscription.created / updated / deleted
+    # -------------------------
+    elif event_type.startswith("customer.subscription."):
+        stripe_sub_id = data.get("id")
+        row = await db.execute(
+            text(
+                "SELECT user_id, id, plan_id FROM subscriptions WHERE stripe_subscription_id=:sid"
+            ),
+            {"sid": stripe_sub_id},
+        )
+        rec = row.fetchone()
+        if rec:
+            actor_id, sub_db_id, old_plan_id = rec
+        else:
+            # create subscription if missing
+            cust_id = data.get("customer")
+            if cust_id:
+                row2 = await db.execute(
+                    text(
+                        "SELECT actor_id FROM checkout_records WHERE raw_session->>'customer'=:cust ORDER BY created_at DESC LIMIT 1"
+                    ),
+                    {"cust": cust_id},
+                )
+                rec2 = row2.fetchone()
+                if rec2:
+                    actor_id = rec2[0]
+                    await db.execute(
+                        text(
+                            """
+                            INSERT INTO subscriptions (user_id, stripe_customer_id, stripe_subscription_id,
+                                                       status, created_at, updated_at)
+                            VALUES (:uid, :cust, :sid, 'active', NOW(), NOW())
+                            ON CONFLICT (stripe_subscription_id) DO NOTHING
+                        """
+                        ),
+                        {"uid": actor_id, "cust": cust_id, "sid": stripe_sub_id},
+                    )
+                    await db.commit()
+                    sub_db_id = (
+                        await db.execute(
+                            text(
+                                "SELECT id FROM subscriptions WHERE stripe_subscription_id=:sid"
+                            ),
+                            {"sid": stripe_sub_id},
+                        )
+                    ).fetchone()[0]
+
+    elif event_type == "customer.subscription.updated":
+        stripe_sub_id = data["id"]
+
+        # 1) Lookup subscription (kept for later blocks)
+        row = await db.execute(
+            text("SELECT id FROM subscriptions WHERE stripe_subscription_id=:sid"),
+            {"sid": stripe_sub_id},
+        )
+        rec = row.fetchone()
+        if rec:
+            sub_db_id = rec[0]
+        else:
+            sub_db_id = (
+                None  # do NOT return → allow invoice handler below to still work
+            )
+
+        # 2) Check for scheduled downgrade
+        if sub_db_id:
+            row = await db.execute(
+                text(
+                    """
+                    SELECT id, target_price_id
+                    FROM scheduled_downgrades
+                    WHERE subscription_id=:sid
+                    ORDER BY created_at DESC LIMIT 1
+                """
+                ),
+                {"sid": sub_db_id},
+            )
+            pending = row.fetchone()
+
+            if pending:
+                downgrade_id = pending.id
+                target_price = pending.target_price_id
+
+                # 3) Apply only when cycle renewed
+                if (
+                    data.get("status") == "active"
+                    and not data.get("cancel_at_period_end")
+                ):
+                    try:
+                        item_id = data["items"]["data"][0]["id"]
+
+                        stripe.Subscription.modify(
+                            stripe_sub_id,
+                            cancel_at_period_end=False,
+                            items=[{"id": item_id, "price": target_price}],
+                            proration_behavior="none",
+                        )
+
+                        await db.execute(
+                            text("DELETE FROM scheduled_downgrades WHERE id=:id"),
+                            {"id": downgrade_id},
+                        )
+                        await db.commit()
+
+                    except Exception as e:
+                        logger.error(f"Failed applying scheduled downgrade: {str(e)}")
+
+    # -------------------------
+    # 5️⃣ payment_intent.succeeded
+    # -------------------------
+    elif event_type.startswith("payment_intent.succeeded"):
+        logger.info("Nothing to process here at payment_method.attached...")
+        pass
+
+    # -------------------------
+    # 6️⃣ invoice.* events (idempotent, no duplicate insert)
+    # -------------------------
+    elif event_type.startswith("invoice."):
+
+        invoice_id = data.get("id")
+        stripe_sub_id = data.get("subscription")
+
+        actor_id = None
+        sub_db_id = None
+
+        # Lookup subscription → get actor_id + subscription DB ID
+        if stripe_sub_id:
+            row = await db.execute(
+                text(
+                    "SELECT user_id, id FROM subscriptions WHERE stripe_subscription_id=:sid"
+                ),
+                {"sid": stripe_sub_id},
+            )
+            rec = row.fetchone()
+            if rec:
+                actor_id, sub_db_id = rec
+
+        # If subscription found → upsert invoice
+        if actor_id and sub_db_id:
+            await db.execute(
+                text(
+                    """
+                    INSERT INTO invoices (
+                        user_id, subscription_id, stripe_invoice_id,
+                        amount_due_cents, amount_paid_cents, currency,
+                        invoice_pdf_url, hosted_invoice_url,
+                        status, period_start, period_end, created_at
+                    ) VALUES (
+                        :uid, :subid, :iid,
+                        :due, :paid, :currency,
+                        :pdf, :hosted,
+                        :status, :pstart, :pend, NOW()
+                    )
+                    ON CONFLICT (stripe_invoice_id) DO UPDATE
+                    SET
+                        status = EXCLUDED.status,
+                        amount_paid_cents = EXCLUDED.amount_paid_cents,
+                        amount_due_cents = EXCLUDED.amount_due_cents,
+                        currency = EXCLUDED.currency,
+                        invoice_pdf_url = EXCLUDED.invoice_pdf_url,
+                        hosted_invoice_url = EXCLUDED.hosted_invoice_url,
+                        period_start = EXCLUDED.period_start,
+                        period_end = EXCLUDED.period_end
+                """
+                ),
+                {
+                    "uid": actor_id,
+                    "subid": sub_db_id,
+                    "iid": invoice_id,
+                    "due": data.get("amount_due", 0),
+                    "paid": data.get("amount_paid", 0),
+                    "currency": data.get("currency", "usd"),
+                    "pdf": data.get("invoice_pdf"),
+                    "hosted": data.get("hosted_invoice_url"),
+                    "status": data.get("status"),
+                    "pstart": (
+                        datetime.fromtimestamp(data.get("period_start"))
+                        if data.get("period_start")
+                        else None
+                    ),
+                    "pend": (
+                        datetime.fromtimestamp(data.get("period_end"))
+                        if data.get("period_end")
+                        else None
+                    ),
+                },
+            )
+        else:
+            logger.info(
+                f"This is data right here, actor_id and sub_db_id: {actor_id} and {sub_db_id}"
+            )
+
+        # Always commit once (safe)
+        await db.commit()
+
+    # -------------------------
+    # Attach PaymentAudit
+    # -------------------------
     db.add(
         PaymentAudit(
             actor_id=actor_id,
             action="WEBHOOK_RECEIVED",
-            session_id=session_id,
+            session_id=data.get("id"),
             details={"event_type": event_type, "event_id": event_id},
             ip_address=client_ip,
             user_agent=user_agent,
@@ -181,200 +496,170 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     )
     await db.commit()
 
-    # -----------------------------
-    # Handle subscription-related events
-    # -----------------------------
-    subscription_events = [
-        "checkout.session.completed",
-        "invoice.paid",
-        "invoice.finalized",
-        "customer.subscription.updated",
-        "customer.subscription.deleted",
-    ]
+    # -------------------------
+    # Lookup organization
+    # -------------------------
+    if actor_id:
+        r = await db.execute(
+            text("SELECT organization_id FROM users WHERE id=:uid"),
+            {"uid": actor_id},
+        )
+        row = r.fetchone()
+        if row:
+            org_id = row[0]
 
-    if event_type in subscription_events:
-        stripe_sub_id = data.get("subscription") or data.get("id")
-        if stripe_sub_id:
+    # -------------------------
+    # Subscription update, plan upgrade, reset usage
+    # -------------------------
+    if (
+        event_type
+        in {
+            "checkout.session.completed",
+            "invoice.paid",
+            "invoice.finalized",
+            "customer.subscription.updated",
+            "customer.subscription.deleted",
+        }
+        and sub_db_id
+    ):
+        try:
             sub_obj = stripe.Subscription.retrieve(
                 stripe_sub_id, expand=["items.data.price"]
             )
-            sub_item = (
-                sub_obj["items"]["data"][0]
-                if sub_obj.get("items", {}).get("data")
-                else None
-            )
+            sub_item = sub_obj["items"]["data"][0]
+            period_start = datetime.fromtimestamp(sub_item.get("current_period_start"))
+            period_end = datetime.fromtimestamp(sub_item.get("current_period_end"))
+            price_id = sub_item["price"]["id"]
 
-            # Get subscription period from subscription item
-            period_start = (
-                datetime.fromtimestamp(sub_item.get("current_period_start"))
-                if sub_item and sub_item.get("current_period_start")
-                else None
-            )
-            period_end = (
-                datetime.fromtimestamp(sub_item.get("current_period_end"))
-                if sub_item and sub_item.get("current_period_end")
-                else None
-            )
-
-            # Get plan_id from price_id
-            price_id = sub_item["price"]["id"] if sub_item else None
-            plan_res = await db.execute(
+            # Determine plan_id and interval
+            result = await db.execute(
                 text(
                     """
-                    SELECT id, name, stripe_price_id_monthly, stripe_price_id_yearly
+                    SELECT id, stripe_price_id_monthly, stripe_price_id_yearly
                     FROM subscription_plans
-                    WHERE stripe_price_id_monthly = :pid OR stripe_price_id_yearly = :pid
+                    WHERE stripe_price_id_monthly=:pid OR stripe_price_id_yearly=:pid
                 """
                 ),
                 {"pid": price_id},
             )
-            plan_row = plan_res.fetchone()
-            plan_id = plan_row.id if plan_row else None
-            interval = (
-                "monthly"
-                if plan_row and price_id == plan_row.stripe_price_id_monthly
-                else "yearly"
-            )
+            row = result.fetchone()
+            if row:
+                plan_id = row.id
+                interval = (
+                    "monthly" if price_id == row.stripe_price_id_monthly else "yearly"
+                )
 
-            # Update or insert subscription
-            existing_sub = await db.execute(
+            # Update subscription in DB
+            await db.execute(
                 text(
-                    "SELECT id FROM subscriptions WHERE stripe_subscription_id = :sid"
+                    """
+                    UPDATE subscriptions
+                    SET plan_id=:pid, status=:status, interval=:interval,
+                        current_period_start=:cps, current_period_end=:cpe,
+                        cancel_at_period_end=:cape, trial_end=:te, updated_at=NOW()
+                    WHERE stripe_subscription_id=:sid
+                """
                 ),
-                {"sid": stripe_sub_id},
+                {
+                    "sid": stripe_sub_id,
+                    "pid": plan_id,
+                    "status": sub_obj["status"],
+                    "interval": interval,
+                    "cps": period_start,
+                    "cpe": period_end,
+                    "cape": sub_obj.get("cancel_at_period_end", False),
+                    "te": (
+                        datetime.fromtimestamp(sub_obj["trial_end"])
+                        if sub_obj.get("trial_end")
+                        else None
+                    ),
+                },
             )
-            row_sub = existing_sub.fetchone()
-            if row_sub:
+            await db.commit()
+
+            # ------------------------------------------------------------------
+            # ⭐ NEW LOGIC: Deactivate older subscriptions
+            # ------------------------------------------------------------------
+            if actor_id:
                 await db.execute(
                     text(
                         """
                         UPDATE subscriptions
-                        SET current_period_start = :cps,
-                            current_period_end = :cpe,
-                            trial_end = :te,
-                            status = :status,
-                            cancel_at_period_end = :cape,
-                            plan_id = :pid,
-                            interval = :interval
-                        WHERE stripe_subscription_id = :sid
+                        SET status = 'inactive'
+                        WHERE user_id = :uid
+                        AND stripe_subscription_id != :current_sid
                     """
                     ),
-                    {
-                        "cps": period_start,
-                        "cpe": period_end,
-                        "te": (
-                            datetime.fromtimestamp(sub_obj["trial_end"])
-                            if sub_obj.get("trial_end")
-                            else None
-                        ),
-                        "status": sub_obj["status"],
-                        "cape": sub_obj.get("cancel_at_period_end", False),
-                        "sid": stripe_sub_id,
-                        "pid": plan_id,
-                        "interval": interval,
-                    },
-                )
-            else:
-                db.add(
-                    Subscription(
-                        user_id=actor_id,
-                        plan_id=plan_id,
-                        stripe_customer_id=sub_obj["customer"],
-                        stripe_subscription_id=sub_obj["id"],
-                        status=sub_obj["status"],
-                        current_period_start=period_start,
-                        current_period_end=period_end,
-                        cancel_at_period_end=sub_obj.get("cancel_at_period_end", False),
-                        trial_end=(
-                            datetime.fromtimestamp(sub_obj["trial_end"])
-                            if sub_obj.get("trial_end")
-                            else None
-                        ),
-                        interval=interval,
-                    )
-                )
-            await db.commit()
-
-        # -----------------------------
-        # Handle invoice info (amount, pdf, currency)
-        # -----------------------------
-        if "invoice" in event_type or event_type.startswith("invoice."):
-            inv_id = data.get("id")
-            amount_paid_cents = int(data.get("amount_paid", 0))
-            currency = data.get("currency", "usd")
-            invoice_pdf_url = data.get("invoice_pdf")
-            hosted_invoice_url = data.get("hosted_invoice_url")
-            period_start_inv = (
-                datetime.fromtimestamp(data.get("period_start"))
-                if data.get("period_start")
-                else period_start
-            )
-            period_end_inv = (
-                datetime.fromtimestamp(data.get("period_end"))
-                if data.get("period_end")
-                else period_end
-            )
-
-            existing_inv = await db.execute(
-                text("SELECT id FROM invoices WHERE stripe_invoice_id = :iid"),
-                {"iid": inv_id},
-            )
-            if existing_inv.scalar() is None:
-                sub_id_in_db = None
-                if stripe_sub_id:
-                    res_sub = await db.execute(
-                        text(
-                            "SELECT id FROM subscriptions WHERE stripe_subscription_id = :sid"
-                        ),
-                        {"sid": stripe_sub_id},
-                    )
-                    row_sub = res_sub.fetchone()
-                    if row_sub:
-                        sub_id_in_db = row_sub[0]
-
-                db.add(
-                    Invoice(
-                        user_id=actor_id,
-                        stripe_invoice_id=inv_id,
-                        subscription_id=sub_id_in_db,
-                        amount_due_cents=int(data.get("amount_due", 0)),
-                        amount_paid_cents=amount_paid_cents,
-                        currency=currency,
-                        invoice_pdf_url=invoice_pdf_url,
-                        hosted_invoice_url=hosted_invoice_url,
-                        status=data.get("status"),
-                        period_start=period_start_inv,
-                        period_end=period_end_inv,
-                    )
+                    {"uid": actor_id, "current_sid": stripe_sub_id},
                 )
                 await db.commit()
 
-    # -----------------------------
-    # Handle payment method attached
-    # -----------------------------
-    elif event_type == "payment_method.attached":
-        pm = data
-        existing_pm = await db.execute(
-            text(
-                "SELECT id FROM payment_methods WHERE stripe_payment_method_id = :pid"
-            ),
-            {"pid": pm["id"]},
-        )
-        if existing_pm.scalar() is None:
-            db.add(
-                PaymentMethod(
-                    user_id=actor_id,
-                    stripe_payment_method_id=pm["id"],
-                    brand=pm["card"]["brand"],
-                    last4=pm["card"]["last4"],
-                    exp_month=pm["card"]["exp_month"],
-                    exp_year=pm["card"]["exp_year"],
-                    is_default=True,
+            # Update organization
+            if org_id and sub_db_id:
+                await db.execute(
+                    text(
+                        """
+                        UPDATE organizations
+                        SET subscription_id = :sid
+                        WHERE id = :org_id
+                    """
+                    ),
+                    {"sid": sub_db_id, "org_id": org_id},
                 )
-            )
-            await db.commit()
+                await db.commit()
 
-    logger.info(f"Processed Stripe event: {event_type}")
+            # Reset usage on upgrade
+            if org_id and plan_id and (old_plan_id is None or old_plan_id != plan_id):
+                old_limits = await db.execute(
+                    text(
+                        "SELECT sbom_limit, project_scan_limit FROM subscription_plans WHERE id=:pid"
+                    ),
+                    {"pid": old_plan_id},
+                )
+                old_row = old_limits.fetchone()
+                old_sbom, old_scan = (
+                    (old_row[0], old_row[1]) if old_row else (None, None)
+                )
+
+                new_limits = await db.execute(
+                    text(
+                        "SELECT sbom_limit, project_scan_limit FROM subscription_plans WHERE id=:pid"
+                    ),
+                    {"pid": plan_id},
+                )
+                new_row = new_limits.fetchone()
+                new_sbom, new_scan = new_row[0], new_row[1]
+
+                if old_sbom is None or new_sbom > old_sbom:
+                    await db.execute(
+                        text(
+                            """
+                            UPDATE usage_counters
+                            SET used=0, period_start=date_trunc('day', NOW()),
+                                period_end=date_trunc('day', NOW()) + INTERVAL '1 day'
+                            WHERE organization_id=:org_id AND usage_key='sbom_upload'
+                        """
+                        ),
+                        {"org_id": org_id},
+                    )
+
+                if old_scan is None or new_scan > old_scan:
+                    await db.execute(
+                        text(
+                            """
+                            UPDATE usage_counters
+                            SET used=0, period_start=date_trunc('day', NOW()),
+                                period_end=date_trunc('day', NOW()) + INTERVAL '1 day'
+                            WHERE organization_id=:org_id AND usage_key='project_scan'
+                        """
+                        ),
+                        {"org_id": org_id},
+                    )
+                await db.commit()
+
+        except Exception as e:
+            logger.error(f"Error updating subscription: {str(e)}")
+
     return {"status": "success"}
 
 
@@ -388,9 +673,9 @@ async def get_latest_subscription(request: Request, db: AsyncSession = Depends(g
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Convert user_id sang int
     user_id = int(user_id)
 
+    # Lấy subscription mới nhất của user
     result = await db.execute(
         select(Subscription)
         .options(
@@ -405,14 +690,16 @@ async def get_latest_subscription(request: Request, db: AsyncSession = Depends(g
     if not subscription:
         raise HTTPException(status_code=404, detail="No active subscription found")
 
-    # Find latest invoice
+    # Lấy invoice mới nhất
     latest_invoice = subscription.invoices[-1] if subscription.invoices else None
 
-    # Find default payment method
+    # Lấy default payment method dựa vào stripe_customer_id
+    stripe_customer_id = subscription.stripe_customer_id
+
     pm_result = await db.execute(
-        select(PaymentMethod).where(
-            PaymentMethod.user_id == user_id, PaymentMethod.is_default
-        )
+        select(PaymentMethod)
+        .where(PaymentMethod.stripe_customer_id == stripe_customer_id)
+        .order_by(PaymentMethod.created_at.desc())
     )
     payment_method = pm_result.scalars().first()
 
@@ -426,6 +713,7 @@ async def get_latest_subscription(request: Request, db: AsyncSession = Depends(g
         "currency": latest_invoice.currency if latest_invoice else "usd",
         "invoice_pdf_url": latest_invoice.invoice_pdf_url if latest_invoice else None,
         "period_end": subscription.current_period_end,
+        # Payment method info
         "card_brand": payment_method.brand if payment_method else None,
         "last4": payment_method.last4 if payment_method else None,
     }
@@ -473,3 +761,270 @@ async def get_subscription_plans(db: AsyncSession = Depends(get_db)):
     except Exception as e:
         logger.exception("Failed to fetch subscription plans")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# GET CURRENT SUBSCRIPTION  (MERGED)
+# ============================================================
+@router.get("/subscription")
+async def get_current_subscription(
+    request: Request, db: AsyncSession = Depends(get_db)
+):
+    """
+    Return the active subscription for the user's organization.
+    """
+    try:
+        # ---- Extract X-User-ID ----
+        user_id = request.headers.get("X-User-ID")
+        if not user_id:
+            raise HTTPException(status_code=400, detail="Missing X-User-ID header")
+
+        # ---- Query user ----
+        user_query = await db.execute(
+            text(
+                """
+                SELECT id, organization_id
+                FROM users
+                WHERE id = :uid
+                """
+            ),
+            {"uid": int(user_id)},
+        )
+        user = user_query.fetchone()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # ---- Query organization ----
+        org_query = await db.execute(
+            text(
+                """
+                SELECT id, subscription_id
+                FROM organizations
+                WHERE id = :oid
+                """
+            ),
+            {"oid": user.organization_id},
+        )
+        org = org_query.fetchone()
+
+        if not org or not org.subscription_id:
+            raise HTTPException(
+                status_code=404, detail="Organization has no subscription"
+            )
+
+        # ---- Query subscription with plan info ----
+        sub_query = await db.execute(
+            text(
+                """
+                SELECT s.id, s.status, s.current_period_end, s.plan_id,
+                       sp.name, sp.description, sp.sbom_limit,
+                       sp.user_limit, sp.monthly_price_cents,
+                       sp.annual_price_cents, sp.currency, s.user_id, s.stripe_subscription_id,
+                       s.stripe_customer_id, s.interval
+                FROM subscriptions s
+                JOIN subscription_plans sp ON sp.id = s.plan_id
+                WHERE s.id = :sid
+                """
+            ),
+            {"sid": org.subscription_id},
+        )
+
+        subscription = sub_query.fetchone()
+
+        if not subscription:
+            raise HTTPException(status_code=404, detail="Subscription not found")
+
+        # ---- Response ----
+        return {
+            "id": str(subscription.id),
+            "status": subscription.status,
+            "currentPeriodEnd": subscription.current_period_end,
+            "plan": {
+                "id": subscription.plan_id,
+                "name": subscription.name,
+                "description": subscription.description,
+                "sbom_limit": subscription.sbom_limit,
+                "user_limit": subscription.user_limit,
+                "monthly_price_cents": subscription.monthly_price_cents,
+                "annual_price_cents": subscription.annual_price_cents,
+                "currency": subscription.currency,
+            },
+            "stripe_customer_id": subscription.stripe_customer_id,
+            "stripeSubscriptionId": subscription.stripe_subscription_id,
+            "interval": subscription.interval,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Billing service error fetching subscription: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/subscription")
+async def update_subscription(
+    req: UpdateSubRequest, request: Request, db: AsyncSession = Depends(get_db)
+):
+    """
+    Upgrade / downgrade / cycle switch.
+    Free users or invalid Stripe subscriptions must re-start checkout.
+    This version calls the REAL endpoint /create-checkout-session (not the helper),
+    so DB records, audit, and webhook actor_id work correctly.
+    """
+
+    # Load target plan
+    target_plan = await get_plan(db, req.targetPlanId)
+
+    # Helper: call the REAL endpoint internally
+    async def call_internal_checkout():
+        payload = {
+            "planId": req.targetPlanId,
+            "interval": req.interval,
+            "user": {
+                "id": req.customerId if hasattr(req, "customerId") else None,
+                "email": req.customerEmail,
+            },
+        }
+        # Important: reuse same request object for extracting IP, UA
+        return await create_new_subscription_session_route(payload, request, db)
+
+    # 1️⃣ If current plan is free → ALWAYS checkout
+    if req.planId == 1:
+        return await call_internal_checkout()
+
+    # 2️⃣ Must have stripeSubscriptionId for paid-plan upgrades
+    if not req.stripeSubscriptionId:
+        return await call_internal_checkout()
+
+    # 3️⃣ Load Stripe subscription
+    try:
+        current = stripe.Subscription.retrieve(
+            req.stripeSubscriptionId, expand=["items.data"]
+        )
+    except Exception:
+        # Stripe does not know it → restart checkout
+        return await call_internal_checkout()
+
+    # 4️⃣ Determine new price
+    new_price_id = (
+        target_plan.stripe_price_id_monthly
+        if req.interval == "monthly"
+        else target_plan.stripe_price_id_yearly
+    )
+
+    # 5️⃣ Switch action
+    if req.action == "upgrade":
+        return await upgrade_subscription_logic(db, current, new_price_id)
+
+    if req.action == "downgrade":
+        return await downgrade_subscription_logic(db, current, new_price_id)
+
+    if req.action == "cycle":
+        return await cycle_switch_logic(db, current, new_price_id)
+
+    raise HTTPException(400, "Invalid subscription action")
+
+
+@router.get("/payment-method")
+async def get_payment_method(request: Request, db: AsyncSession = Depends(get_db)):
+    """
+    Return user's default payment method.
+    Now resolved by going through subscription -> stripe_customer_id.
+    """
+    user_id = request.headers.get("X-User-ID")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    user_id = int(user_id)
+    # 1) Find subscription of user to get stripe_customer_id
+    sub_res = await db.execute(
+        select(Subscription)
+        .where(Subscription.user_id == user_id)
+        .where(Subscription.status == "active")
+        .order_by(Subscription.current_period_end.desc())
+        .limit(1)
+    )
+    subscription = sub_res.scalars().first()
+
+    if not subscription or not subscription.stripe_customer_id:
+        return {"payment_method": None}
+
+    cust_id = subscription.stripe_customer_id
+
+    # 2) Fetch default payment method for that customer
+    pm_res = await db.execute(
+        select(PaymentMethod)
+        .where(PaymentMethod.stripe_customer_id == cust_id)
+        .order_by(PaymentMethod.created_at.desc())
+    )
+    pm = pm_res.scalars().first()
+
+    if not pm:
+        return {"payment_method": None}
+
+    return {
+        "id": pm.id,
+        "brand": pm.brand,
+        "last4": pm.last4,
+        "exp_month": pm.exp_month,
+        "exp_year": pm.exp_year,
+        "is_default": pm.is_default,
+    }
+
+
+@router.get("/invoices")
+async def get_invoices(
+    request: Request, db: AsyncSession = Depends(get_db), page: int = 1, limit: int = 6
+):
+    """
+    Paginated invoice history for authenticated user.
+    """
+    user_id = request.headers.get("X-User-ID")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    user_id = int(user_id)
+
+    # --- Count total invoices ---
+    total_result = await db.execute(
+        select(func.count()).select_from(Invoice).where(Invoice.user_id == user_id)
+    )
+    total = total_result.scalar() or 0
+    # --- Pagination ---
+    offset = (page - 1) * limit
+    query = (
+        select(Invoice)
+        .where(Invoice.user_id == user_id)
+        .order_by(Invoice.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+
+    result = await db.execute(query)
+    invoices = result.scalars().all()
+
+    # --- Build response items ---
+    items = [
+        {
+            "id": inv.stripe_invoice_id,
+            "amount_due_cents": inv.amount_due_cents,
+            "amount_paid_cents": inv.amount_paid_cents,
+            "currency": inv.currency,
+            "status": inv.status,
+            "invoice_pdf_url": inv.invoice_pdf_url,
+            "hosted_invoice_url": inv.hosted_invoice_url,
+            "created": inv.created_at.isoformat() if inv.created_at else None,
+            "period_start": inv.period_start.isoformat() if inv.period_start else None,
+            "period_end": inv.period_end.isoformat() if inv.period_end else None,
+        }
+        for inv in invoices
+    ]
+
+    return {
+        "items": items,
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "total_pages": (total + limit - 1) // limit,
+    }
