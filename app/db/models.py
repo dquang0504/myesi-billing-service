@@ -149,7 +149,7 @@ class PaymentMethod(Base):
     __tablename__ = "payment_methods"
 
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
+    stripe_customer_id = Column(String(255), nullable=False)
     stripe_payment_method_id = Column(String(255), unique=True, nullable=False)
     brand = Column(String(50))
     last4 = Column(String(4))

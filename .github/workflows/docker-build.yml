@@ -32,7 +32,7 @@ jobs:
       - name: Build & Push Docker image
         run: |
           IMAGE=${{ secrets.DOCKER_USERNAME }}/myesi-billing-service
-          docker build -t $IMAGE:${{ github.sha }} .
+          docker build -f Dockerfile.prod -t $IMAGE:${{ github.sha }} .
           docker tag $IMAGE:${{ github.sha }} $IMAGE:latest
           docker push $IMAGE:${{ github.sha }}
           docker push $IMAGE:latest
