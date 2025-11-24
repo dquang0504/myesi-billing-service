@@ -370,9 +370,8 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                 target_price = pending.target_price_id
 
                 # 3) Apply only when cycle renewed
-                if (
-                    data.get("status") == "active"
-                    and not data.get("cancel_at_period_end")
+                if data.get("status") == "active" and not data.get(
+                    "cancel_at_period_end"
                 ):
                     try:
                         item_id = data["items"]["data"][0]["id"]
