@@ -27,10 +27,51 @@ from app.utils.extract_client_info import extract_client_info
 from app.db.models import SubscriptionPlan
 from sqlalchemy.orm import selectinload
 from app.schemas.models import UpdateSubRequest
+import httpx
 
 
 router = APIRouter(prefix="/api/billing", tags=["Billing"])
 logger = logging.getLogger("billing")
+
+
+async def notify_payment(
+    org_id: int,
+    status: str,
+    amount_cents: int,
+    currency: str,
+    plan_name: str,
+    hosted_invoice_url: str = None,
+):
+    """
+    Send payment notification to notification-service via internal event ingress.
+    status: 'success' | 'failed'
+    """
+    if not org_id or not settings.NOTIFICATION_SERVICE_URL:
+        return
+    event = {
+        "type": f"payment.{status}",
+        "organization_id": org_id,
+        "severity": "info" if status == "success" else "critical",
+        "payload": {
+            "amount": amount_cents,
+            "currency": currency or "usd",
+            "plan_name": plan_name,
+            "invoice_url": hosted_invoice_url,
+            "status": status,
+        },
+    }
+    headers = {}
+    if settings.NOTIFICATION_SERVICE_TOKEN:
+        headers["X-Service-Token"] = settings.NOTIFICATION_SERVICE_TOKEN
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"{settings.NOTIFICATION_SERVICE_URL}/api/notification/events",
+                json=event,
+                headers=headers,
+            )
+    except Exception as e:
+        logger.warning(f"Failed to notify payment event: {e}")
 
 
 @router.post("/create-checkout-session")
@@ -171,6 +212,7 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         None,
         None,
     )
+    plan_name = None
 
     # -------------------------
     # 0️⃣ charge.succeeded
@@ -403,12 +445,12 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     # 6️⃣ invoice.* events (idempotent, no duplicate insert)
     # -------------------------
     elif event_type.startswith("invoice."):
-
         invoice_id = data.get("id")
         stripe_sub_id = data.get("subscription")
 
         actor_id = None
         sub_db_id = None
+        customer_id = data.get("customer")
 
         # Lookup subscription → get actor_id + subscription DB ID
         if stripe_sub_id:
@@ -421,6 +463,48 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             rec = row.fetchone()
             if rec:
                 actor_id, sub_db_id = rec
+
+        # If actor_id missing, try to recover from checkout record for the customer
+        if not actor_id and customer_id:
+            row = await db.execute(
+                text(
+                    "SELECT actor_id FROM checkout_records WHERE raw_session->>'customer'=:cust ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"cust": customer_id},
+            )
+            rec = row.fetchone()
+            if rec:
+                actor_id = rec[0]
+
+        # Ensure subscription exists when invoice precedes checkout or customer.subscription events
+        if stripe_sub_id and actor_id and not sub_db_id:
+            await db.execute(
+                text(
+                    """
+                    INSERT INTO subscriptions (user_id, stripe_customer_id, stripe_subscription_id,
+                                               status, created_at, updated_at)
+                    VALUES (:uid, :cust, :sid, 'active', NOW(), NOW())
+                    ON CONFLICT (stripe_subscription_id) DO NOTHING
+                """
+                ),
+                {"uid": actor_id, "cust": customer_id, "sid": stripe_sub_id},
+            )
+            await db.commit()
+            row = await db.execute(
+                text("SELECT id FROM subscriptions WHERE stripe_subscription_id=:sid"),
+                {"sid": stripe_sub_id},
+            )
+            rec = row.fetchone()
+            if rec:
+                sub_db_id = rec[0]
+                logger.info(
+                    "Auto-created subscription record during invoice webhook",
+                    extra={
+                        "stripe_subscription_id": stripe_sub_id,
+                        "invoice_id": invoice_id,
+                        "actor_id": actor_id,
+                    },
+                )
 
         # If subscription found → upsert invoice
         if actor_id and sub_db_id:
@@ -473,12 +557,28 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                 },
             )
         else:
-            logger.info(
-                f"This is data right here, actor_id and sub_db_id: {actor_id} and {sub_db_id}"
+            logger.warning(
+                f"Skipping invoice {invoice_id} — subscription {stripe_sub_id} not linked yet"
             )
 
         # Always commit once (safe)
         await db.commit()
+
+        # Plan name for notification (best-effort)
+        plan_name = None
+        if sub_db_id:
+            row = await db.execute(
+                text(
+                    """
+                    SELECT sp.name
+                    FROM subscriptions s
+                    JOIN subscription_plans sp ON sp.id = s.plan_id
+                    WHERE s.id = :sid
+                    """
+                ),
+                {"sid": sub_db_id},
+            )
+            plan_name = row.scalar()
 
     # -------------------------
     # Attach PaymentAudit
@@ -506,6 +606,26 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         row = r.fetchone()
         if row:
             org_id = row[0]
+
+    # -------------------------
+    # Payment notifications (org-wide)
+    # -------------------------
+    payment_status = None
+    if event_type in {"invoice.payment_succeeded", "invoice.paid"}:
+        payment_status = "success"
+    elif event_type in {"invoice.payment_failed", "invoice.payment_action_required"}:
+        payment_status = "failed"
+
+    if payment_status and org_id:
+        amount_cents = data.get("amount_paid") or data.get("amount_due") or 0
+        await notify_payment(
+            org_id=org_id,
+            status=payment_status,
+            amount_cents=amount_cents,
+            currency=data.get("currency", "usd"),
+            plan_name=plan_name,
+            hosted_invoice_url=data.get("hosted_invoice_url"),
+        )
 
     # -------------------------
     # Subscription update, plan upgrade, reset usage
@@ -731,7 +851,7 @@ async def get_subscription_plans(db: AsyncSession = Depends(get_db)):
                 """
                 SELECT id, name, description,
                     monthly_price_cents, annual_price_cents,
-                    sbom_limit, user_limit, currency, is_active,
+                    sbom_limit, user_limit, project_scan_limit, currency, is_active,
                     stripe_price_id_monthly, stripe_price_id_yearly, stripe_product_id
                 FROM subscription_plans
                 WHERE is_active = TRUE
@@ -748,6 +868,7 @@ async def get_subscription_plans(db: AsyncSession = Depends(get_db)):
                 "annual_price_cents": row.annual_price_cents,
                 "sbom_limit": row.sbom_limit,
                 "user_limit": row.user_limit,
+                "project_scan_limit": row.project_scan_limit,
                 "currency": row.currency,
                 "stripe_price_id_monthly": row.stripe_price_id_monthly,
                 "stripe_price_id_yearly": row.stripe_price_id_yearly,
@@ -818,7 +939,7 @@ async def get_current_subscription(
                 """
                 SELECT s.id, s.status, s.current_period_end, s.plan_id,
                        sp.name, sp.description, sp.sbom_limit,
-                       sp.user_limit, sp.monthly_price_cents,
+                       sp.user_limit, sp.project_scan_limit, sp.monthly_price_cents,
                        sp.annual_price_cents, sp.currency, s.user_id, s.stripe_subscription_id,
                        s.stripe_customer_id, s.interval
                 FROM subscriptions s
@@ -845,6 +966,7 @@ async def get_current_subscription(
                 "description": subscription.description,
                 "sbom_limit": subscription.sbom_limit,
                 "user_limit": subscription.user_limit,
+                "project_scan_limit": subscription.project_scan_limit,
                 "monthly_price_cents": subscription.monthly_price_cents,
                 "annual_price_cents": subscription.annual_price_cents,
                 "currency": subscription.currency,
