@@ -2,7 +2,7 @@ from fastapi import Request
 
 
 def extract_client_info(request: Request):
-    """Lấy IP và User-Agent thật, có xử lý X-Forwarded-For."""
+    """Fetches actual IP and User-Agent, handles X-Forwarded-For."""
     forwarded_for = request.headers.get("x-forwarded-for")
     if forwarded_for:
         client_ip = forwarded_for.split(",")[0].strip()
