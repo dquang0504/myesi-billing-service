@@ -1,4 +1,5 @@
 from pydantic import BaseModel, EmailStr
+from typing import Literal, Optional
 
 
 class UpdateSubRequest(BaseModel):
@@ -9,3 +10,8 @@ class UpdateSubRequest(BaseModel):
     customerEmail: EmailStr
     customerId: int
     targetPlanId: int
+
+
+class CancelSubscriptionRequest(BaseModel):
+    mode: Literal["cycle_end", "immediate"] = "cycle_end"
+    refund: Optional[Literal["full", "prorated", "none"]] = "none"
