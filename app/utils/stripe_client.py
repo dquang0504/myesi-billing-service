@@ -14,6 +14,7 @@ def create_new_subscription_session(
     quantity: int = 1,
     idempotency_key: Optional[str] = None,
     mode: str = "subscription",
+    tax_line: Optional[dict] = None,
 ):
     """
     Creates a Stripe Checkout session for a subscription plan.
@@ -25,11 +26,36 @@ def create_new_subscription_session(
     if idempotency_key:
         opts["idempotency_key"] = idempotency_key
 
+    line_items = [{"price": price_id, "quantity": quantity}]
+    if tax_line and tax_line.get("amount_cents", 0) > 0:
+        interval = tax_line.get("interval", "month")
+        if isinstance(interval, str):
+            interval_map = {
+                "monthly": "month",
+                "yearly": "year",
+                "month": "month",
+                "year": "year",
+            }
+            interval = interval_map.get(interval.lower(), interval)
+        line_items.append(
+            {
+                "price_data": {
+                    "currency": tax_line.get("currency", "usd"),
+                    "unit_amount": tax_line["amount_cents"],
+                    "product_data": {
+                        "name": tax_line.get("label", "Digital Services Tax")
+                    },
+                    "recurring": {"interval": interval or "month"},
+                },
+                "quantity": 1,
+            }
+        )
+
     session = stripe.checkout.Session.create(
         customer_email=customer_email,
         payment_method_types=["card"],
         mode=mode,  # 'subscription' by default
-        line_items=[{"price": price_id, "quantity": quantity}],
+        line_items=line_items,
         allow_promotion_codes=True,
         success_url="https://localhost:3000/admin/subscription/success?session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url="https://localhost:3000/admin/subscription/cancel",
@@ -155,7 +181,7 @@ async def downgrade_subscription_logic(db, current_sub, new_price_id):
         # lookup subscription_id
         row = await db.execute(
             text(
-                "SELECT id, user_id FROM subscriptions WHERE stripe_subscription_id=:sid"
+                "SELECT id, billing_contact_user_id FROM subscriptions WHERE stripe_subscription_id=:sid"
             ),
             {"sid": current_sub["id"]},
         )
@@ -221,57 +247,76 @@ async def downgrade_subscription_logic(db, current_sub, new_price_id):
 # ---------------------------
 async def cycle_switch_logic(db, current_sub, new_price_id):
     """
-    Monthly -> Yearly = upgrade
-    Yearly -> Monthly = downgrade
+    Switching between billing cycles follows explicit rules:
+      - Monthly -> Yearly: immediate upgrade with potential prorated charge.
+      - Yearly -> Monthly: scheduled downgrade at the end of the paid term.
     """
     try:
-        old_price = current_sub["items"]["data"][0]["price"]["id"]
+        current_item = current_sub["items"]["data"][0]
+        current_price = current_item["price"]["id"]
 
-        # fetch old plan to compare price
-        old_plan_res = await db.execute(
+        # Fetch plan definition once so we know both price ids
+        plan_res = await db.execute(
             text(
                 """
-                SELECT monthly_price_cents, annual_price_cents,
-                       stripe_price_id_monthly, stripe_price_id_yearly
+                SELECT stripe_price_id_monthly, stripe_price_id_yearly
                 FROM subscription_plans
                 WHERE stripe_price_id_monthly=:pid OR stripe_price_id_yearly=:pid
-            """
-            ),
-            {"pid": old_price},
-        )
-        old = old_plan_res.fetchone()
-        if not old:
-            raise HTTPException(400, "Old plan not found")
-
-        # determine upgrade or downgrade by price
-        old_amount = (
-            old.monthly_price_cents
-            if old_price == old.stripe_price_id_monthly
-            else old.annual_price_cents
-        )
-
-        new_plan_res = await db.execute(
-            text(
                 """
-                SELECT monthly_price_cents, annual_price_cents,
-                       stripe_price_id_monthly, stripe_price_id_yearly
-                FROM subscription_plans
-                WHERE stripe_price_id_monthly=:pid OR stripe_price_id_yearly=:pid
-            """
             ),
-            {"pid": new_price_id},
+            {"pid": current_price},
         )
-        new = new_plan_res.fetchone()
-        new_amount = (
-            new.monthly_price_cents
-            if new_price_id == new.stripe_price_id_monthly
-            else new.annual_price_cents
-        )
+        plan = plan_res.fetchone()
+        if not plan:
+            raise HTTPException(400, "Unable to locate current plan for cycle switch")
 
-        if new_amount > old_amount:
-            return await upgrade_subscription_logic(db, current_sub, new_price_id)
+        if current_price == plan.stripe_price_id_monthly:
+            current_interval = "monthly"
+        elif current_price == plan.stripe_price_id_yearly:
+            current_interval = "yearly"
         else:
-            return await downgrade_subscription_logic(db, current_sub, new_price_id)
+            raise HTTPException(400, "Unsupported current billing interval")
 
+        if new_price_id == plan.stripe_price_id_monthly:
+            requested_interval = "monthly"
+        elif new_price_id == plan.stripe_price_id_yearly:
+            requested_interval = "yearly"
+        else:
+            raise HTTPException(
+                400, "Requested billing interval is not part of the current plan"
+            )
+
+        if current_interval == requested_interval:
+            raise HTTPException(
+                400, f"Subscription already uses the {requested_interval} interval."
+            )
+
+        if current_interval == "monthly" and requested_interval == "yearly":
+            resp = await upgrade_subscription_logic(db, current_sub, new_price_id)
+            resp.setdefault(
+                "message",
+                "Switched to yearly billing immediately. Prorated charges may apply.",
+            )
+            resp["cycle_switch"] = {
+                "from": "monthly",
+                "to": "yearly",
+                "mode": "immediate_upgrade",
+            }
+            return resp
+
+        resp = await downgrade_subscription_logic(db, current_sub, new_price_id)
+        resp.setdefault(
+            "message",
+            "Switch to monthly billing scheduled at the end of the current term.",
+        )
+        resp["cycle_switch"] = {
+            "from": "yearly",
+            "to": "monthly",
+            "mode": "scheduled_downgrade",
+        }
+        return resp
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"Cycle switch failed: {str(e)}")

@@ -4,11 +4,16 @@ import uuid
 from fastapi import APIRouter, Depends, Request, HTTPException
 from sqlalchemy import func, text, select
 from app.utils.stripe_client import (
-    create_new_subscription_session,
     cycle_switch_logic,
     downgrade_subscription_logic,
     upgrade_subscription_logic,
     get_plan,
+)
+from app.utils.payment_provider import (
+    CheckoutContext,
+    ProviderError,
+    get_payment_provider,
+    snapshot_plan,
 )
 from app.core.config import settings
 from app.db.session import get_db
@@ -22,16 +27,528 @@ from app.db.models import (
 import stripe
 from app.db.models import Subscription
 from sqlalchemy.ext.asyncio import AsyncSession
-import asyncio
 from app.utils.extract_client_info import extract_client_info
 from app.db.models import SubscriptionPlan
 from sqlalchemy.orm import selectinload
-from app.schemas.models import UpdateSubRequest
+from app.schemas.models import UpdateSubRequest, CancelSubscriptionRequest
+from app.services.tax_service import calculate_tax
+from app.services.billing_address_service import (
+    create_address,
+    get_address_by_id,
+    get_default_address,
+    list_active_addresses,
+)
 import httpx
+from typing import Optional
 
 
 router = APIRouter(prefix="/api/billing", tags=["Billing"])
 logger = logging.getLogger("billing")
+FREE_PLAN_ID = getattr(settings, "FREE_PLAN_ID", 0)
+
+
+async def _resolve_org_id(db: AsyncSession, user_id: int) -> int:
+    result = await db.execute(
+        text("SELECT organization_id FROM users WHERE id=:uid"),
+        {"uid": user_id},
+    )
+    row = result.fetchone()
+    if not row or not row[0]:
+        raise HTTPException(status_code=404, detail="User organization not found")
+    return row[0]
+
+
+async def _ensure_subscription_record(
+    db: AsyncSession,
+    stripe_subscription_id: Optional[str],
+    stripe_customer_id: Optional[str],
+) -> tuple[Optional[int], Optional[int], Optional[int]]:
+    """
+    Guarantee that a local subscription row exists for the provided Stripe subscription id.
+    Returns tuple (actor_id, subscription_id, plan_id).
+    """
+    if not stripe_subscription_id:
+        return None, None, None
+
+    row = await db.execute(
+        text(
+            "SELECT billing_contact_user_id, id, plan_id FROM subscriptions WHERE stripe_subscription_id=:sid"
+        ),
+        {"sid": stripe_subscription_id},
+    )
+    rec = row.fetchone()
+    if rec:
+        return rec.billing_contact_user_id, rec.id, rec.plan_id
+
+    if not stripe_customer_id:
+        return None, None, None
+
+    checkout_row = await db.execute(
+        text(
+            """
+            SELECT actor_id
+            FROM checkout_records
+            WHERE raw_session->>'customer'=:cust
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"cust": stripe_customer_id},
+    )
+    checkout = checkout_row.fetchone()
+    if not checkout:
+        return None, None, None
+
+    actor_id = checkout[0]
+    await db.execute(
+        text(
+            """
+            INSERT INTO subscriptions (created_by, billing_contact_user_id, stripe_customer_id,
+                                       stripe_subscription_id, status, created_at, updated_at)
+            VALUES (:uid, :uid, :cust, :sid, 'active', NOW(), NOW())
+            ON CONFLICT (stripe_subscription_id) DO NOTHING
+            """
+        ),
+        {"uid": actor_id, "cust": stripe_customer_id, "sid": stripe_subscription_id},
+    )
+    await db.commit()
+
+    row = await db.execute(
+        text(
+            "SELECT billing_contact_user_id, id, plan_id FROM subscriptions WHERE stripe_subscription_id=:sid"
+        ),
+        {"sid": stripe_subscription_id},
+    )
+    rec = row.fetchone()
+    if rec:
+        return rec.billing_contact_user_id, rec.id, rec.plan_id
+    return actor_id, None, None
+
+
+async def _apply_scheduled_downgrade(
+    db: AsyncSession,
+    stripe_subscription_id: str,
+    subscription_db_id: Optional[int],
+    actor_id: Optional[int],
+    subscription_payload: dict,
+    client_ip: Optional[str],
+    user_agent: Optional[str],
+) -> None:
+    """
+    Apply a pending scheduled downgrade when a new billing cycle starts.
+    """
+    if not subscription_db_id:
+        return
+
+    row = await db.execute(
+        text(
+            """
+            SELECT id, target_price_id
+            FROM scheduled_downgrades
+            WHERE subscription_id=:sid
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"sid": subscription_db_id},
+    )
+    pending = row.fetchone()
+    if not pending:
+        return
+
+    if subscription_payload.get("cancel_at_period_end"):
+        # still waiting for current cycle to end; keep schedule
+        logger.debug(
+            "Scheduled downgrade pending for subscription %s but cancel_at_period_end=True; skipping until renewal",
+            stripe_subscription_id,
+        )
+        return
+
+    items = subscription_payload.get("items", {}).get("data") or []
+    if not items:
+        logger.warning(
+            "Unable to apply scheduled downgrade for %s: missing items payload",
+            stripe_subscription_id,
+        )
+        return
+
+    target_price = pending.target_price_id
+    subscription_item_id = items[0]["id"]
+
+    try:
+        stripe.Subscription.modify(
+            stripe_subscription_id,
+            cancel_at_period_end=False,
+            proration_behavior="none",
+            items=[{"id": subscription_item_id, "price": target_price}],
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to apply scheduled downgrade for %s: %s",
+            stripe_subscription_id,
+            exc,
+        )
+        return
+
+    await db.execute(
+        text("DELETE FROM scheduled_downgrades WHERE id=:id"),
+        {"id": pending.id},
+    )
+    db.add(
+        PaymentAudit(
+            actor_id=actor_id,
+            action="scheduled_downgrade_applied",
+            session_id=stripe_subscription_id,
+            details={
+                "subscription_id": subscription_db_id,
+                "target_price_id": target_price,
+            },
+            ip_address=client_ip,
+            user_agent=user_agent,
+        )
+    )
+    await db.commit()
+
+    logger.info(
+        "Scheduled downgrade applied",
+        extra={
+            "stripe_subscription_id": stripe_subscription_id,
+            "target_price_id": target_price,
+        },
+    )
+
+
+def _stripe_obj_to_dict(obj):
+    if hasattr(obj, "to_dict_recursive"):
+        return obj.to_dict_recursive()
+    return obj
+
+
+async def _fetch_subscription_for_org(db: AsyncSession, org_id: int):
+    result = await db.execute(
+        text(
+            """
+            SELECT
+                s.id AS subscription_id,
+                s.billing_contact_user_id,
+                s.plan_id,
+                s.stripe_subscription_id,
+                s.status,
+                s.current_period_start,
+                s.current_period_end,
+                s.cancel_at_period_end,
+                s.stripe_customer_id
+            FROM organizations o
+            JOIN subscriptions s ON s.id = o.subscription_id
+            WHERE o.id = :oid
+            LIMIT 1
+            """
+        ),
+        {"oid": org_id},
+    )
+    return result.fetchone()
+
+
+def _extract_payment_intent_id(invoice: Optional[dict]) -> Optional[str]:
+    if not invoice:
+        return None
+    payment_intent = invoice.get("payment_intent")
+    if isinstance(payment_intent, dict):
+        return payment_intent.get("id")
+    return payment_intent
+
+
+def _calculate_prorated_amount(
+    amount_paid_cents: int,
+    period_start: Optional[datetime],
+    period_end: Optional[datetime],
+) -> int:
+    if not amount_paid_cents or not period_start or not period_end:
+        return 0
+    total_seconds = (period_end - period_start).total_seconds()
+    if total_seconds <= 0:
+        return 0
+    remaining_seconds = (period_end - datetime.utcnow()).total_seconds()
+    if remaining_seconds <= 0:
+        return 0
+    prorated = int(amount_paid_cents * (remaining_seconds / total_seconds))
+    return min(max(prorated, 0), amount_paid_cents)
+
+
+def _get_latest_paid_invoice(stripe_subscription_id: str) -> Optional[dict]:
+    invoices = []
+    try:
+        invoice_list = stripe.Invoice.list(
+            subscription=stripe_subscription_id, limit=1, status="paid"
+        )
+        invoices = getattr(invoice_list, "data", None) or invoice_list.get("data", [])
+    except Exception:
+        try:
+            invoice_list = stripe.Invoice.list(
+                subscription=stripe_subscription_id, limit=1
+            )
+            invoices = getattr(invoice_list, "data", None) or invoice_list.get(
+                "data", []
+            )
+        except Exception:
+            invoices = []
+
+    if not invoices:
+        return None
+
+    invoice = _stripe_obj_to_dict(invoices[0])
+    if invoice.get("status") != "paid":
+        return None
+    return invoice
+
+
+async def _cancel_subscription_cycle_end(
+    db: AsyncSession,
+    subscription_row,
+    actor_id: int,
+    client_ip: Optional[str],
+    user_agent: Optional[str],
+) -> dict:
+    stripe_sub_id = subscription_row.stripe_subscription_id
+    if subscription_row.cancel_at_period_end:
+        return {
+            "success": True,
+            "mode": "cycle_end",
+            "cancel_at_period_end": True,
+            "current_period_end": subscription_row.current_period_end,
+        }
+
+    try:
+        stripe.Subscription.modify(stripe_sub_id, cancel_at_period_end=True)
+    except Exception as exc:
+        logger.error(
+            "Failed to set cancel_at_period_end for subscription %s: %s",
+            stripe_sub_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to update subscription in Stripe. Please try again later.",
+        )
+
+    await db.execute(
+        text(
+            """
+            UPDATE subscriptions
+            SET cancel_at_period_end=TRUE, updated_at=NOW()
+            WHERE id=:sid
+            """
+        ),
+        {"sid": subscription_row.subscription_id},
+    )
+    db.add(
+        PaymentAudit(
+            actor_id=actor_id,
+            action="cancel_at_cycle_end",
+            session_id=stripe_sub_id,
+            details={"subscription_id": subscription_row.subscription_id},
+            ip_address=client_ip,
+            user_agent=user_agent,
+        )
+    )
+    await db.commit()
+
+    return {
+        "success": True,
+        "mode": "cycle_end",
+        "cancel_at_period_end": True,
+        "current_period_end": subscription_row.current_period_end,
+    }
+
+
+async def _cancel_subscription_immediately(
+    db: AsyncSession,
+    subscription_row,
+    actor_id: int,
+    refund_mode: Optional[str],
+    client_ip: Optional[str],
+    user_agent: Optional[str],
+) -> dict:
+    stripe_sub_id = subscription_row.stripe_subscription_id
+
+    existing = await db.execute(
+        text(
+            """
+            SELECT refund_amount_cents, refund_currency, refund_mode, stripe_refund_id
+            FROM cancellation_requests
+            WHERE subscription_id=:sid AND mode='immediate'
+            LIMIT 1
+            """
+        ),
+        {"sid": subscription_row.subscription_id},
+    )
+    existing_row = existing.fetchone()
+    if existing_row:
+        return {
+            "success": True,
+            "mode": "immediate",
+            "canceled": True,
+            "refunded": (existing_row.refund_amount_cents or 0) > 0,
+            "refund_amount_cents": existing_row.refund_amount_cents or 0,
+            "currency": existing_row.refund_currency or "usd",
+            "refund_mode": existing_row.refund_mode,
+            "stripe_refund_id": existing_row.stripe_refund_id,
+        }
+
+    invoice_data = _get_latest_paid_invoice(stripe_sub_id)
+    amount_paid = invoice_data.get("amount_paid", 0) if invoice_data else 0
+    currency = invoice_data.get("currency", "usd") if invoice_data else "usd"
+    invoice_id = invoice_data.get("id") if invoice_data else None
+    payment_intent_id = (
+        _extract_payment_intent_id(invoice_data) if invoice_data else None
+    )
+
+    normalized_mode = refund_mode or "none"
+    if normalized_mode not in {"full", "prorated", "none"}:
+        normalized_mode = "none"
+
+    refund_amount = 0
+    if normalized_mode == "full":
+        refund_amount = amount_paid
+    elif normalized_mode == "prorated":
+        refund_amount = _calculate_prorated_amount(
+            amount_paid,
+            subscription_row.current_period_start,
+            subscription_row.current_period_end,
+        )
+
+    try:
+        stripe.Subscription.delete(stripe_sub_id)
+    except stripe.error.InvalidRequestError as exc:
+        if getattr(exc, "code", "") == "resource_missing":
+            logger.info(
+                "Stripe subscription %s already canceled: %s",
+                stripe_sub_id,
+                exc.user_message or str(exc),
+            )
+        else:
+            logger.error(
+                "Failed to cancel subscription %s immediately: %s",
+                stripe_sub_id,
+                exc,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="Unable to cancel subscription immediately. Please try again later.",
+            )
+
+    refund_id = None
+
+    if refund_amount > 0 and payment_intent_id:
+        try:
+            refund_resp = stripe.Refund.create(
+                payment_intent=payment_intent_id,
+                amount=refund_amount,
+                reason="requested_by_customer",
+                idempotency_key=f"cancel-{subscription_row.subscription_id}-{invoice_id or 'none'}-{refund_amount}",
+            )
+            refund_id = refund_resp.get("id") if refund_resp else None
+        except Exception as exc:
+            logger.error(
+                "Failed to create refund for subscription %s: %s",
+                stripe_sub_id,
+                exc,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="Refund failed while canceling subscription. Please try again.",
+            )
+    elif refund_amount > 0 and not payment_intent_id:
+        logger.warning(
+            "Unable to refund subscription %s due to missing payment intent",
+            stripe_sub_id,
+        )
+        refund_amount = 0
+
+    cancelled_at = datetime.utcnow()
+
+    await db.execute(
+        text(
+            """
+            UPDATE subscriptions
+            SET status='canceled',
+                cancel_at_period_end=FALSE,
+                current_period_end=:now,
+                updated_at=:now
+            WHERE id=:sid
+            """
+        ),
+        {"sid": subscription_row.subscription_id, "now": cancelled_at},
+    )
+
+    await db.execute(
+        text(
+            """
+            INSERT INTO cancellation_requests
+                (subscription_id, stripe_subscription_id, mode, refund_mode,
+                 refund_amount_cents, refund_currency, stripe_refund_id,
+                 stripe_invoice_id, payment_intent_id)
+            VALUES
+                (:sid, :stripe_sid, 'immediate', :refund_mode, :amount, :currency,
+                 :refund_id, :invoice_id, :payment_intent_id)
+            """
+        ),
+        {
+            "sid": subscription_row.subscription_id,
+            "stripe_sid": stripe_sub_id,
+            "refund_mode": normalized_mode,
+            "amount": refund_amount,
+            "currency": currency,
+            "refund_id": refund_id,
+            "invoice_id": invoice_id,
+            "payment_intent_id": payment_intent_id,
+        },
+    )
+
+    db.add(
+        PaymentAudit(
+            actor_id=actor_id,
+            action="cancel_immediately",
+            session_id=stripe_sub_id,
+            details={
+                "refund_mode": normalized_mode,
+                "refund_amount_cents": refund_amount,
+                "currency": currency,
+            },
+            ip_address=client_ip,
+            user_agent=user_agent,
+        )
+    )
+
+    if refund_id:
+        db.add(
+            PaymentAudit(
+                actor_id=actor_id,
+                action="refund_created",
+                session_id=refund_id,
+                details={
+                    "invoice_id": invoice_id,
+                    "payment_intent_id": payment_intent_id,
+                    "amount_cents": refund_amount,
+                    "currency": currency,
+                },
+                ip_address=client_ip,
+                user_agent=user_agent,
+            )
+        )
+
+    await db.commit()
+
+    return {
+        "success": True,
+        "mode": "immediate",
+        "canceled": True,
+        "refunded": refund_amount > 0,
+        "refund_amount_cents": refund_amount,
+        "currency": currency,
+        "refund_mode": normalized_mode,
+        "stripe_refund_id": refund_id,
+    }
 
 
 async def notify_payment(
@@ -74,14 +591,12 @@ async def notify_payment(
         logger.warning(f"Failed to notify payment event: {e}")
 
 
-@router.post("/create-checkout-session")
-async def create_new_subscription_session_route(
-    payload: dict, request: Request, db: AsyncSession = Depends(get_db)
+async def _create_checkout_session_for_provider(
+    provider_name: str,
+    payload: dict,
+    request: Request,
+    db: AsyncSession,
 ):
-    """
-    Create a Stripe Checkout Session for a given plan.
-    Frontend sends: { "planId": 1, "interval": "monthly" | "yearly" }
-    """
     plan_id = payload.get("planId")
     interval = payload.get("interval", "monthly").lower()
 
@@ -90,86 +605,205 @@ async def create_new_subscription_session_route(
     if interval not in ["monthly", "yearly"]:
         raise HTTPException(status_code=400, detail="Invalid interval value")
 
-    # Get user from middleware or fallback mock
     user_data = payload.get("user", {})
-    print("This is user_data: ", user_data)
     actor_id = user_data.get("id")
     actor_email = user_data.get("email")
+    if not actor_email:
+        raise HTTPException(status_code=400, detail="Customer email is required")
+    if provider_name == "paddle" and not actor_id:
+        raise HTTPException(status_code=400, detail="Missing user context for Paddle")
 
-    # 1. Fetch plan info
     result = await db.execute(
         select(SubscriptionPlan).where(SubscriptionPlan.id == plan_id)
     )
     plan = result.scalar_one_or_none()
-
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
     if not plan.is_active:
         raise HTTPException(status_code=400, detail="Plan is not active")
 
-    # 2. Choose Stripe price id depending on interval
-    price_id = (
-        plan.stripe_price_id_monthly
-        if interval == "monthly"
-        else plan.stripe_price_id_yearly
-    )
     amount_cents = (
         plan.monthly_price_cents if interval == "monthly" else plan.annual_price_cents
     )
+    tax_details = calculate_tax(amount_cents)
+    total_amount_cents = tax_details["total_cents"]
 
-    # 3. Create Stripe session
     idempotency_key = str(uuid.uuid4())
     client_ip, user_agent = extract_client_info(request)
+    provider = get_payment_provider(provider_name)
+    org_id = None
+    billing_address = None
 
-    try:
-        loop = asyncio.get_running_loop()
-        session = await loop.run_in_executor(
-            None,
-            lambda: create_new_subscription_session(
-                customer_email=actor_email,
-                price_id=price_id,
-                idempotency_key=idempotency_key,
-            ),
+    metadata = {"plan_id": plan.id, "provider": provider_name}
+    if provider_name == "paddle":
+        org_id = await _resolve_org_id(db, int(actor_id))
+        org_row = await db.execute(
+            text("SELECT paddle_customer_id FROM organizations WHERE id=:oid"),
+            {"oid": org_id},
+        )
+        org_rec = org_row.fetchone()
+        paddle_customer_id = org_rec.paddle_customer_id if org_rec else None
+        billing_address_id = payload.get("billing_address_id")
+        billing_address_payload = payload.get("billing_address") or {}
+
+        if billing_address_id:
+            billing_address = await get_address_by_id(
+                db, org_id, int(billing_address_id)
+            )
+            if not billing_address:
+                raise HTTPException(status_code=404, detail="Billing address not found")
+        elif billing_address_payload:
+            billing_address = await create_address(
+                db,
+                org_id,
+                label=billing_address_payload.get("label"),
+                country_code=billing_address_payload.get("country_code"),
+                postal_code=billing_address_payload.get("postal_code"),
+                make_default=bool(billing_address_payload.get("make_default", False)),
+                created_by=actor_id,
+            )
+            db.add(
+                PaymentAudit(
+                    actor_id=actor_id,
+                    action="billing_address_created",
+                    details={
+                        "address_id": billing_address["id"],
+                        "organization_id": org_id,
+                        "source": "paddle_checkout",
+                    },
+                    ip_address=client_ip,
+                    user_agent=user_agent,
+                )
+            )
+            await db.commit()
+        else:
+            billing_address = await get_default_address(db, org_id)
+
+        if not billing_address:
+            existing_addresses = await list_active_addresses(db, org_id)
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "detail": "billing_address_required",
+                    "required_fields": ["country_code", "postal_code"],
+                    "existing_addresses": existing_addresses,
+                },
+            )
+
+        metadata.update(
+            {
+                "org_id": org_id,
+                "billing_address_id": billing_address["id"],
+                "country_code": billing_address["country_code"],
+                "postal_code": billing_address["postal_code"],
+                "paddle_customer_id": paddle_customer_id,
+            }
         )
 
-        # 4. Save record & audit
+    ctx = CheckoutContext(
+        plan=snapshot_plan(plan),
+        interval=interval,
+        actor_id=actor_id,
+        actor_email=actor_email,
+        subtotal_cents=amount_cents,
+        total_cents=total_amount_cents,
+        currency=plan.currency,
+        tax_details=tax_details,
+        idempotency_key=idempotency_key,
+        metadata=metadata,
+    )
+
+    try:
+        checkout = await provider.create_checkout(ctx)
+        session_payload = dict(checkout.raw_session)
+        session_payload.setdefault("tax_breakdown", tax_details)
+        session_payload.setdefault("provider", provider_name)
+
         record = CheckoutRecord(
             actor_id=actor_id,
-            session_id=session["id"],
+            session_id=checkout.session_id,
             customer_email=actor_email,
-            amount=amount_cents,
+            amount=total_amount_cents,
             currency=plan.currency,
             status="created",
             idempotency_key=idempotency_key,
-            raw_session=session,
+            raw_session=session_payload,
         )
         db.add(record)
 
         audit = PaymentAudit(
             actor_id=actor_id,
-            action="create_new_subscription_session",
-            session_id=session["id"],
-            details={"plan": plan.name, "interval": interval, "amount": amount_cents},
+            action=f"create_{provider_name}_checkout",
+            session_id=checkout.session_id,
+            details={
+                "plan": plan.name,
+                "interval": interval,
+                "subtotal_cents": amount_cents,
+                "tax_cents": tax_details["tax_cents"],
+                "total_cents": total_amount_cents,
+                "tax_rate_percent": tax_details["tax_rate_percent"],
+            },
             ip_address=client_ip,
             user_agent=user_agent,
         )
         db.add(audit)
+        if provider_name == "paddle" and org_id:
+            paddle_customer_id = session_payload.get("paddle_customer_id")
+            if paddle_customer_id:
+                await db.execute(
+                    text(
+                        """
+                        UPDATE organizations
+                        SET paddle_customer_id = COALESCE(paddle_customer_id, :pid)
+                        WHERE id = :org_id
+                        """
+                    ),
+                    {"pid": paddle_customer_id, "org_id": org_id},
+                )
+
         await db.commit()
 
         logger.info(
-            "Stripe checkout created",
+            "%s checkout created",
+            provider_name.capitalize(),
             extra={
-                "session_id": session["id"],
+                "session_id": checkout.session_id,
                 "plan": plan.name,
                 "interval": interval,
             },
         )
-
-        return {"success": True, "url": session["url"], "session_id": session["id"]}
-
-    except Exception as e:
+        return {
+            "success": True,
+            "url": checkout.checkout_url,
+            "session_id": checkout.session_id,
+            "tax": tax_details,
+        }
+    except ProviderError as exc:
+        logger.exception("Checkout creation failed via provider")
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    except Exception as exc:
         logger.exception("Checkout creation failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/create-checkout-session")
+async def create_new_subscription_session_route(
+    payload: dict, request: Request, db: AsyncSession = Depends(get_db)
+):
+    """
+    Create a Stripe checkout session.
+    """
+    return await _create_checkout_session_for_provider("stripe", payload, request, db)
+
+
+@router.post("/paddle/create-checkout")
+async def create_paddle_checkout_route(
+    payload: dict, request: Request, db: AsyncSession = Depends(get_db)
+):
+    """
+    Create a Paddle checkout session.
+    """
+    return await _create_checkout_session_for_provider("paddle", payload, request, db)
 
 
 @router.post("/webhook")
@@ -186,8 +820,11 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         event = stripe.Webhook.construct_event(
             payload, sig_header, settings.STRIPE_WEBHOOK_SECRET
         )
-    except stripe.error.SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Invalid signature")
+    except Exception as e:
+        # Stripe signature verification error (compatible across stripe versions)
+        if e.__class__.__name__ == "SignatureVerificationError":
+            raise HTTPException(status_code=400, detail="Invalid signature")
+        raise
 
     event_id = event.get("id")
     event_type = event.get("type")
@@ -304,9 +941,9 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                 await db.execute(
                     text(
                         """
-                        INSERT INTO subscriptions (user_id, stripe_customer_id, stripe_subscription_id,
-                                                   status, created_at, updated_at)
-                        VALUES (:uid, :cust, :sid, 'active', NOW(), NOW())
+                        INSERT INTO subscriptions (created_by, billing_contact_user_id, stripe_customer_id,
+                                                   stripe_subscription_id, status, created_at, updated_at)
+                        VALUES (:uid, :uid, :cust, :sid, 'active', NOW(), NOW())
                         ON CONFLICT (stripe_subscription_id) DO NOTHING
                     """
                     ),
@@ -329,110 +966,30 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             ).fetchone()[0]
 
     # -------------------------
-    # 4️⃣ customer.subscription.created / updated / deleted
+    # 4️⃣ customer.subscription.* events
     # -------------------------
     elif event_type.startswith("customer.subscription."):
         stripe_sub_id = data.get("id")
-        row = await db.execute(
-            text(
-                "SELECT user_id, id, plan_id FROM subscriptions WHERE stripe_subscription_id=:sid"
-            ),
-            {"sid": stripe_sub_id},
+        ensured_actor_id, ensured_sub_db_id, ensured_plan_id = (
+            await _ensure_subscription_record(db, stripe_sub_id, data.get("customer"))
         )
-        rec = row.fetchone()
-        if rec:
-            actor_id, sub_db_id, old_plan_id = rec
-        else:
-            # create subscription if missing
-            cust_id = data.get("customer")
-            if cust_id:
-                row2 = await db.execute(
-                    text(
-                        "SELECT actor_id FROM checkout_records WHERE raw_session->>'customer'=:cust ORDER BY created_at DESC LIMIT 1"
-                    ),
-                    {"cust": cust_id},
-                )
-                rec2 = row2.fetchone()
-                if rec2:
-                    actor_id = rec2[0]
-                    await db.execute(
-                        text(
-                            """
-                            INSERT INTO subscriptions (user_id, stripe_customer_id, stripe_subscription_id,
-                                                       status, created_at, updated_at)
-                            VALUES (:uid, :cust, :sid, 'active', NOW(), NOW())
-                            ON CONFLICT (stripe_subscription_id) DO NOTHING
-                        """
-                        ),
-                        {"uid": actor_id, "cust": cust_id, "sid": stripe_sub_id},
-                    )
-                    await db.commit()
-                    sub_db_id = (
-                        await db.execute(
-                            text(
-                                "SELECT id FROM subscriptions WHERE stripe_subscription_id=:sid"
-                            ),
-                            {"sid": stripe_sub_id},
-                        )
-                    ).fetchone()[0]
+        if ensured_actor_id:
+            actor_id = ensured_actor_id
+        if ensured_sub_db_id:
+            sub_db_id = ensured_sub_db_id
+        if ensured_plan_id is not None:
+            old_plan_id = ensured_plan_id
 
-    elif event_type == "customer.subscription.updated":
-        stripe_sub_id = data["id"]
-
-        # 1) Lookup subscription (kept for later blocks)
-        row = await db.execute(
-            text("SELECT id FROM subscriptions WHERE stripe_subscription_id=:sid"),
-            {"sid": stripe_sub_id},
-        )
-        rec = row.fetchone()
-        if rec:
-            sub_db_id = rec[0]
-        else:
-            sub_db_id = (
-                None  # do NOT return → allow invoice handler below to still work
+        if event_type == "customer.subscription.updated" and stripe_sub_id:
+            await _apply_scheduled_downgrade(
+                db,
+                stripe_sub_id,
+                sub_db_id,
+                actor_id,
+                data,
+                client_ip,
+                user_agent,
             )
-
-        # 2) Check for scheduled downgrade
-        if sub_db_id:
-            row = await db.execute(
-                text(
-                    """
-                    SELECT id, target_price_id
-                    FROM scheduled_downgrades
-                    WHERE subscription_id=:sid
-                    ORDER BY created_at DESC LIMIT 1
-                """
-                ),
-                {"sid": sub_db_id},
-            )
-            pending = row.fetchone()
-
-            if pending:
-                downgrade_id = pending.id
-                target_price = pending.target_price_id
-
-                # 3) Apply only when cycle renewed
-                if data.get("status") == "active" and not data.get(
-                    "cancel_at_period_end"
-                ):
-                    try:
-                        item_id = data["items"]["data"][0]["id"]
-
-                        stripe.Subscription.modify(
-                            stripe_sub_id,
-                            cancel_at_period_end=False,
-                            items=[{"id": item_id, "price": target_price}],
-                            proration_behavior="none",
-                        )
-
-                        await db.execute(
-                            text("DELETE FROM scheduled_downgrades WHERE id=:id"),
-                            {"id": downgrade_id},
-                        )
-                        await db.commit()
-
-                    except Exception as e:
-                        logger.error(f"Failed applying scheduled downgrade: {str(e)}")
 
     # -------------------------
     # 5️⃣ payment_intent.succeeded
@@ -456,7 +1013,7 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         if stripe_sub_id:
             row = await db.execute(
                 text(
-                    "SELECT user_id, id FROM subscriptions WHERE stripe_subscription_id=:sid"
+                    "SELECT billing_contact_user_id, id FROM subscriptions WHERE stripe_subscription_id=:sid"
                 ),
                 {"sid": stripe_sub_id},
             )
@@ -481,9 +1038,9 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             await db.execute(
                 text(
                     """
-                    INSERT INTO subscriptions (user_id, stripe_customer_id, stripe_subscription_id,
-                                               status, created_at, updated_at)
-                    VALUES (:uid, :cust, :sid, 'active', NOW(), NOW())
+                    INSERT INTO subscriptions (created_by, billing_contact_user_id, stripe_customer_id,
+                                               stripe_subscription_id, status, created_at, updated_at)
+                    VALUES (:uid, :uid, :cust, :sid, 'active', NOW(), NOW())
                     ON CONFLICT (stripe_subscription_id) DO NOTHING
                 """
                 ),
@@ -506,6 +1063,27 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                     },
                 )
 
+        subtotal_cents = data.get("subtotal")
+        tax_cents = data.get("tax")
+        total_cents = data.get("total")
+        if subtotal_cents is None:
+            subtotal_cents = data.get("amount_due", 0)
+            if tax_cents:
+                subtotal_cents = max(subtotal_cents - tax_cents, 0)
+
+        if total_cents is None:
+            total_cents = (subtotal_cents or 0) + (tax_cents or 0)
+
+        if tax_cents is None and subtotal_cents not in (None, 0):
+            tax_cents = max(total_cents - subtotal_cents, 0)
+
+        tax_rate_percent = data.get("tax_percent")
+        if tax_rate_percent is None and subtotal_cents:
+            if subtotal_cents > 0:
+                tax_rate_percent = (tax_cents or 0) / subtotal_cents * 100
+        tax_code = settings.TAX_DEFAULT_CODE
+        tax_jurisdiction = settings.TAX_DEFAULT_JURISDICTION
+
         # If subscription found → upsert invoice
         if actor_id and sub_db_id:
             await db.execute(
@@ -515,12 +1093,18 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                         user_id, subscription_id, stripe_invoice_id,
                         amount_due_cents, amount_paid_cents, currency,
                         invoice_pdf_url, hosted_invoice_url,
-                        status, period_start, period_end, created_at
+                        status, period_start, period_end,
+                        subtotal_cents, tax_cents, total_cents,
+                        tax_rate_percent, tax_code, tax_jurisdiction,
+                        created_at
                     ) VALUES (
                         :uid, :subid, :iid,
                         :due, :paid, :currency,
                         :pdf, :hosted,
-                        :status, :pstart, :pend, NOW()
+                        :status, :pstart, :pend,
+                        :subtotal, :tax, :total,
+                        :tax_rate, :tax_code, :tax_jurisdiction,
+                        NOW()
                     )
                     ON CONFLICT (stripe_invoice_id) DO UPDATE
                     SET
@@ -531,7 +1115,13 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                         invoice_pdf_url = EXCLUDED.invoice_pdf_url,
                         hosted_invoice_url = EXCLUDED.hosted_invoice_url,
                         period_start = EXCLUDED.period_start,
-                        period_end = EXCLUDED.period_end
+                        period_end = EXCLUDED.period_end,
+                        subtotal_cents = EXCLUDED.subtotal_cents,
+                        tax_cents = EXCLUDED.tax_cents,
+                        total_cents = EXCLUDED.total_cents,
+                        tax_rate_percent = EXCLUDED.tax_rate_percent,
+                        tax_code = EXCLUDED.tax_code,
+                        tax_jurisdiction = EXCLUDED.tax_jurisdiction
                 """
                 ),
                 {
@@ -554,6 +1144,12 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                         if data.get("period_end")
                         else None
                     ),
+                    "subtotal": subtotal_cents,
+                    "tax": tax_cents,
+                    "total": total_cents,
+                    "tax_rate": tax_rate_percent,
+                    "tax_code": tax_code,
+                    "tax_jurisdiction": tax_jurisdiction,
                 },
             )
         else:
@@ -705,7 +1301,7 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                         """
                         UPDATE subscriptions
                         SET status = 'inactive'
-                        WHERE user_id = :uid
+                        WHERE billing_contact_user_id = :uid
                         AND stripe_subscription_id != :current_sid
                     """
                     ),
@@ -801,7 +1397,7 @@ async def get_latest_subscription(request: Request, db: AsyncSession = Depends(g
             selectinload(Subscription.plan),
             selectinload(Subscription.invoices),
         )
-        .where(Subscription.user_id == user_id)
+        .where(Subscription.billing_contact_user_id == user_id)
         .order_by(Subscription.created_at.desc())
         .limit(1)
     )
@@ -940,7 +1536,7 @@ async def get_current_subscription(
                 SELECT s.id, s.status, s.current_period_end, s.plan_id,
                        sp.name, sp.description, sp.sbom_limit,
                        sp.user_limit, sp.project_scan_limit, sp.monthly_price_cents,
-                       sp.annual_price_cents, sp.currency, s.user_id, s.stripe_subscription_id,
+                       sp.annual_price_cents, sp.currency, s.billing_contact_user_id, s.stripe_subscription_id,
                        s.stripe_customer_id, s.interval
                 FROM subscriptions s
                 JOIN subscription_plans sp ON sp.id = s.plan_id
@@ -983,6 +1579,47 @@ async def get_current_subscription(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/subscription/cancel")
+async def cancel_subscription(
+    payload: CancelSubscriptionRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    user_id_header = request.headers.get("X-User-ID")
+    if not user_id_header:
+        raise HTTPException(status_code=400, detail="Missing X-User-ID header")
+
+    try:
+        actor_id = int(user_id_header)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid X-User-ID header")
+
+    client_ip, user_agent = extract_client_info(request)
+    org_id = await _resolve_org_id(db, actor_id)
+    subscription_row = await _fetch_subscription_for_org(db, org_id)
+
+    if not subscription_row:
+        raise HTTPException(
+            status_code=404, detail="Subscription not found for organization"
+        )
+
+    if not subscription_row.stripe_subscription_id:
+        raise HTTPException(
+            status_code=400, detail="Subscription is not linked to a Stripe record"
+        )
+
+    if payload.mode == "cycle_end":
+        return await _cancel_subscription_cycle_end(
+            db, subscription_row, actor_id, client_ip, user_agent
+        )
+    if payload.mode == "immediate":
+        return await _cancel_subscription_immediately(
+            db, subscription_row, actor_id, payload.refund, client_ip, user_agent
+        )
+
+    raise HTTPException(status_code=400, detail="Invalid cancellation mode")
+
+
 @router.put("/subscription")
 async def update_subscription(
     req: UpdateSubRequest, request: Request, db: AsyncSession = Depends(get_db)
@@ -1011,7 +1648,7 @@ async def update_subscription(
         return await create_new_subscription_session_route(payload, request, db)
 
     # 1️⃣ If current plan is free → ALWAYS checkout
-    if req.planId == 1:
+    if req.planId == FREE_PLAN_ID:
         return await call_internal_checkout()
 
     # 2️⃣ Must have stripeSubscriptionId for paid-plan upgrades
@@ -1047,6 +1684,204 @@ async def update_subscription(
     raise HTTPException(400, "Invalid subscription action")
 
 
+@router.get("/usage")
+async def get_billing_usage_overview(
+    request: Request, db: AsyncSession = Depends(get_db)
+):
+    user_id = request.headers.get("X-User-ID")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Missing X-User-ID header")
+    user_id = int(user_id)
+
+    org_id = await _resolve_org_id(db, user_id)
+
+    plan_result = await db.execute(
+        text(
+            """
+            SELECT sp.id, sp.name, sp.description,
+                   sp.sbom_limit, sp.user_limit,
+                   sp.project_scan_limit, sp.scan_rate_limit,
+                   sp.monthly_price_cents, sp.annual_price_cents, sp.currency,
+                   s.interval, s.current_period_start, s.current_period_end
+            FROM organizations o
+            JOIN subscriptions s ON s.id = o.subscription_id
+            JOIN subscription_plans sp ON sp.id = s.plan_id
+            WHERE o.id = :oid
+            """
+        ),
+        {"oid": org_id},
+    )
+    plan_row = plan_result.fetchone()
+    if not plan_row:
+        raise HTTPException(status_code=404, detail="Subscription plan not found")
+
+    usage_rows = await db.execute(
+        text(
+            """
+            SELECT usage_key, used, period_start, period_end
+            FROM usage_counters
+            WHERE organization_id = :oid
+              AND usage_key IN ('sbom_upload', 'project_scan', 'api_requests')
+            """
+        ),
+        {"oid": org_id},
+    )
+    usage_map = {row.usage_key: row for row in usage_rows.fetchall()}
+
+    def build_usage(key: str, limit: int | None):
+        entry = usage_map.get(key)
+        used = entry.used if entry else 0
+        next_reset = (
+            entry.period_end.isoformat() if entry and entry.period_end else None
+        )
+        remaining = None
+        percent = None
+        if limit is not None and limit >= 0:
+            remaining = max(limit - used, 0)
+            percent = min(100, round((used / limit) * 100, 2)) if limit > 0 else 0
+        return {
+            "used": int(used),
+            "limit": limit,
+            "remaining": remaining,
+            "nextReset": next_reset,
+            "percent": percent,
+        }
+
+    sbom_usage = build_usage("sbom_upload", getattr(plan_row, "sbom_limit", None))
+    scan_usage = build_usage(
+        "project_scan", getattr(plan_row, "project_scan_limit", None)
+    )
+    api_limit = getattr(plan_row, "scan_rate_limit", None)
+    api_usage = build_usage("api_requests", api_limit)
+
+    seats_result = await db.execute(
+        text(
+            """
+            SELECT COUNT(*) FROM users
+            WHERE organization_id = :oid AND COALESCE(is_active, TRUE) = TRUE
+            """
+        ),
+        {"oid": org_id},
+    )
+    seats_used = seats_result.scalar() or 0
+    seat_limit = getattr(plan_row, "user_limit", None)
+    seat_usage = {
+        "used": seats_used,
+        "limit": seat_limit,
+        "remaining": (
+            (seat_limit - seats_used)
+            if seat_limit is not None and seat_limit >= 0
+            else None
+        ),
+        "percent": (
+            min(100, round((seats_used / seat_limit) * 100, 2))
+            if seat_limit and seat_limit > 0
+            else None
+        ),
+    }
+
+    history_rows = await db.execute(
+        text(
+            """
+            WITH dates AS (
+                SELECT generate_series(date_trunc('day', NOW()) - INTERVAL '13 days',
+                                       date_trunc('day', NOW()),
+                                       INTERVAL '1 day')::date AS day
+            ),
+            sbom_counts AS (
+                SELECT DATE(s.created_at) AS day, COUNT(*) AS uploads
+                FROM sboms s
+                JOIN projects p ON p.id = s.project_id
+                WHERE p.organization_id = :oid
+                  AND s.created_at >= NOW() - INTERVAL '14 days'
+                GROUP BY DATE(s.created_at)
+            ),
+            scan_counts AS (
+                SELECT DATE(s.created_at) AS day, COUNT(*) AS scans
+                FROM sboms s
+                JOIN projects p ON p.id = s.project_id
+                WHERE p.organization_id = :oid
+                  AND s.source IN ('auto-code-scan','project_scan')
+                  AND s.created_at >= NOW() - INTERVAL '14 days'
+                GROUP BY DATE(s.created_at)
+            )
+            SELECT d.day,
+                   COALESCE(sb.uploads, 0) AS sbom_uploads,
+                   COALESCE(sc.scans, 0) AS project_scans
+            FROM dates d
+            LEFT JOIN sbom_counts sb ON sb.day = d.day
+            LEFT JOIN scan_counts sc ON sc.day = d.day
+            ORDER BY d.day
+            """
+        ),
+        {"oid": org_id},
+    )
+    history = [
+        {
+            "date": row.day.isoformat(),
+            "sbom_uploads": int(row.sbom_uploads),
+            "project_scans": int(row.project_scans),
+        }
+        for row in history_rows.fetchall()
+    ]
+
+    invoice_stats_row = await db.execute(
+        text(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN inv.status = 'paid' THEN 1 ELSE 0 END) AS paid_count,
+                SUM(CASE WHEN inv.status != 'paid' THEN inv.amount_due_cents ELSE 0 END) AS outstanding_cents,
+                SUM(inv.amount_paid_cents) AS total_paid_cents
+            FROM invoices inv
+            JOIN subscriptions s ON inv.subscription_id = s.id
+            JOIN organizations o ON o.subscription_id = s.id
+            WHERE o.id = :oid
+            """
+        ),
+        {"oid": org_id},
+    )
+    invoice_stats = invoice_stats_row.fetchone()
+
+    return {
+        "plan": {
+            "id": plan_row.id,
+            "name": plan_row.name,
+            "description": plan_row.description,
+            "interval": plan_row.interval,
+            "nextRenewal": (
+                plan_row.current_period_end.isoformat()
+                if plan_row.current_period_end
+                else None
+            ),
+            "cycleStart": (
+                plan_row.current_period_start.isoformat()
+                if plan_row.current_period_start
+                else None
+            ),
+            "limits": {
+                "sbom": plan_row.sbom_limit,
+                "users": plan_row.user_limit,
+                "project_scans": plan_row.project_scan_limit,
+                "api_calls_per_minute": plan_row.scan_rate_limit,
+            },
+        },
+        "usage": {
+            "sbomUploads": sbom_usage,
+            "projectScans": scan_usage,
+            "seats": seat_usage,
+            "apiCalls": api_usage,
+        },
+        "history": history,
+        "invoiceStats": {
+            "total": invoice_stats.total if invoice_stats else 0,
+            "paid": invoice_stats.paid_count if invoice_stats else 0,
+            "outstanding_cents": invoice_stats.outstanding_cents or 0,
+            "total_paid_cents": invoice_stats.total_paid_cents or 0,
+        },
+    }
+
+
 @router.get("/payment-method")
 async def get_payment_method(request: Request, db: AsyncSession = Depends(get_db)):
     """
@@ -1061,7 +1896,7 @@ async def get_payment_method(request: Request, db: AsyncSession = Depends(get_db
     # 1) Find subscription of user to get stripe_customer_id
     sub_res = await db.execute(
         select(Subscription)
-        .where(Subscription.user_id == user_id)
+        .where(Subscription.billing_contact_user_id == user_id)
         .where(Subscription.status == "active")
         .order_by(Subscription.current_period_end.desc())
         .limit(1)
@@ -1128,7 +1963,7 @@ async def get_invoices(
     # --- Build response items ---
     items = [
         {
-            "id": inv.stripe_invoice_id,
+            "id": inv.id,
             "amount_due_cents": inv.amount_due_cents,
             "amount_paid_cents": inv.amount_paid_cents,
             "currency": inv.currency,
@@ -1141,6 +1976,20 @@ async def get_invoices(
         }
         for inv in invoices
     ]
+
+    try:
+        client_ip, user_agent = extract_client_info(request)
+        audit = PaymentAudit(
+            actor_id=user_id,
+            action="view_invoices",
+            details={"page": page, "limit": limit, "returned": len(items)},
+            ip_address=client_ip,
+            user_agent=user_agent,
+        )
+        db.add(audit)
+        await db.commit()
+    except Exception as audit_err:
+        logger.warning(f"Failed to log invoice view: {audit_err}")
 
     return {
         "items": items,
